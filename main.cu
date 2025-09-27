@@ -1,41 +1,24 @@
-#include "utils.cuh"
-#include "src/GridworldEnv.h"
+#include "config.hpp"
+#include "environment.hpp"
 
-// ... #defines ...
+#include <cstdio>
+#include <vector>
 
 int main() {
-    int seed = 0;
-    // ... other setup ...
+    TrainingConfig config;
+    config.input_bits = 4;
+    config.output_bits = 6;
+    config.batch_size = 4;
+    config.task = TrainingTask::Add;
 
-    // Create an instance of our environment
-    GridworldEnv env(BATCHES, BOARD_D, seed);
+    Environment env(config);
 
-    // Allocate DEVICE buffers here (all the d* buffers)
-    int* dActions = mallocDeviceTensor<int>(BATCHES * SEQUENCES);
-    // ... etc ...
+    std::vector<float> inputs;
+    std::vector<float> targets;
+    env.generateBatch(inputs, targets);
 
-    for (int epoch = 0; epoch < EPOCHES; epoch++) {
-        for (int batchIteration = 0; batchIteration < BATCH_ITERATIONS; batchIteration++) {
-            env.reset();
+    std::printf("Generated %zu samples (input width %zu, target width %zu)\n",
+                config.batch_size, env.inputWidth(), env.outputWidth());
 
-            // You'll need a cudaMemcpy here to get the state to the GPU
-            // cudaMemcpy(dForward, env.get_state(), ...);
-
-            for (int sequence = 0; sequence < SEQUENCES; sequence++) {
-                // ... AI FORWARD PASS LOGIC ...
-
-                // Copy actions from GPU to some host buffer `hActions`
-                // cudaMemcpy(hActions, dActions + offset, ...);
-
-                // Tell the environment to take a step
-                env.step(hActions);
-
-                // Copy new state and rewards to GPU
-                // cudaMemcpy(dForward + offset, env.get_state(), ...);
-                // cudaMemcpy(dReward, env.get_rewards(), ...);
-            }
-            // ... AI BACKWARD PASS & UPDATE LOGIC ...
-        }
-    }
     return 0;
 }
