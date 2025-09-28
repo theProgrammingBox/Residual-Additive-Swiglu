@@ -1,17 +1,22 @@
 ﻿#include "header.cuh"
 
-#define LOG_SKIPS 1
-#define EPOCHS 1
+#define LOG_SKIPS (1 * 16)
+#define EPOCHS (16 * 16)
 #define BATCH_ITERATIONS 1
-#define BATCH_SIZE 3
+#define BATCH_SIZE (16 * 16)
 
 #define INPUT_BITS 2
 #define RESIDUAL_SIZE 6
 #define SWIGLUS 1
 #define LAYERS 1
 
+#define LR 0.01f
+#define MEAN_BETA 0.9f
+#define VAR_BETA 0.999f
+#define EPSILON 1e-8f
+
 int main() {
-    assert(INPUT_BITS > 0 && INPUT_BITS <= 32);
+    assert(INPUT_BITS > 0 && INPUT_BITS <= 16);
     
     int seed = 0;
     cublasHandle_t cublasHandle;
@@ -37,7 +42,8 @@ int main() {
     normalRandFill(
         RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE * LAYERS,
         dSwigluSumWeights, RESIDUAL_SIZE * SWIGLUS * 2,
-        seed, 0.0f, 0.02f
+        // seed, 0.0f, 0.02f
+        seed, 0.0f, rsqrtf(RESIDUAL_SIZE)
     );
     
     time_t start_time, end_time;
@@ -58,7 +64,9 @@ int main() {
                     hInput[offset + bit] = (float)((a >> bit) & 1u);
                     hInput[offset + INPUT_BITS + bit] = (float)((b >> bit) & 1u);
                 }
-                unsigned int sum = a + b;
+                // unsigned int sum = a + b;
+                // concat for identical input and target
+                unsigned int sum = b << INPUT_BITS | a;
                 for (int bit = 0; bit < INPUT_BITS * 2; bit++) {
                     hOutput[offset + bit] = (float)((sum >> bit) & 1u);
                 }
@@ -71,11 +79,11 @@ int main() {
                 INPUT_BITS * 2 * sizeof(float), BATCH_SIZE,
                 cudaMemcpyHostToDevice
             );
-            printDeviceTensor(
-                "input, only first %d used",
-                RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                dForward, RESIDUAL_SIZE * SWIGLUS * 2, INPUT_BITS * 2
-            );
+            // printDeviceTensor(
+            //     "input, only first %d used",
+            //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
+            //     dForward, RESIDUAL_SIZE * SWIGLUS * 2, INPUT_BITS * 2
+            // );
             
             // copy output to device
             cudaMemcpy2D(
@@ -84,11 +92,11 @@ int main() {
                 INPUT_BITS * 2 * sizeof(float), BATCH_SIZE,
                 cudaMemcpyHostToDevice
             );
-            printDeviceTensor(
-                "target, only first %d used",
-                RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, INPUT_BITS * 2
-            );
+            // printDeviceTensor(
+            //     "target, only first %d used",
+            //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
+            //     dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, INPUT_BITS * 2
+            // );
             
             // layered forward pass
             for (int layer = 0; layer < LAYERS; layer++) {
@@ -103,11 +111,11 @@ int main() {
                     dNorm, RESIDUAL_SIZE, 0,
                     1
                 );
-                printDeviceTensor(
-                    "norm %d",
-                    RESIDUAL_SIZE, BATCH_SIZE,
-                    dNorm, RESIDUAL_SIZE, layer
-                );
+                // printDeviceTensor(
+                //     "norm %d",
+                //     RESIDUAL_SIZE, BATCH_SIZE,
+                //     dNorm, RESIDUAL_SIZE, layer
+                // );
                 
                 // swiglus gemm
                 cublasGemmEx(
@@ -120,11 +128,11 @@ int main() {
                     dForward + nextForwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
                 );
-                printDeviceTensor(
-                    "swiglu gemm %d",
-                    RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, layer + 1
-                );
+                // printDeviceTensor(
+                //     "swiglu gemm %d",
+                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
+                //     dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, layer + 1
+                // );
                 
                 // residual swiglu sum
                 // TODO error in offset for swiglu
@@ -135,11 +143,11 @@ int main() {
                     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     1
                 );
-                printDeviceTensor(
-                    "residual swiglu %d",
-                    RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, layer + 1
-                );
+                // printDeviceTensor(
+                //     "residual swiglu %d",
+                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
+                //     dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, layer + 1
+                // );
             }
             
             // get error and clear unused part of backward top
@@ -156,11 +164,11 @@ int main() {
                 dBackwardTop + INPUT_BITS * 2, RESIDUAL_SIZE * SWIGLUS * 2 * sizeof(float),
                 0, (RESIDUAL_SIZE * SWIGLUS * 2 - INPUT_BITS * 2) * sizeof(float), BATCH_SIZE
             );
-            printDeviceTensor(
-                "error, only first %d used",
-                RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, INPUT_BITS * 2
-            );
+            // printDeviceTensor(
+            //     "error, only first %d used",
+            //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
+            //     dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, INPUT_BITS * 2
+            // );
             
             // accumulate loss
             if ((epoch + 1) % LOG_SKIPS == 0) {
@@ -179,16 +187,75 @@ int main() {
                 int swigluSumWeightLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * layer;
                 
                 // residual swiglu grad
+                // TODO error in offset for swiglu
                 residualSwigluGrad(
-                    RESIDUAL_SIZE, BATCHES,
-                    dBackwardTop, 2 * RESIDUAL_SIZE, BATCHES * (2 * RESIDUAL_SIZE),
-                    dBackwardTop + RESIDUAL_SIZE, 2 * RESIDUAL_SIZE, BATCHES * (2 * RESIDUAL_SIZE),
-                    dBackwardBottom, 2 * RESIDUAL_SIZE, BATCHES * (2 * RESIDUAL_SIZE),
-                    dForward[layer + 1], 2 * RESIDUAL_SIZE, BATCHES * (2 * RESIDUAL_SIZE),
-                    dForward[layer + 1] + RESIDUAL_SIZE, 2 * RESIDUAL_SIZE, BATCHES * (2 * RESIDUAL_SIZE),
-                    dForward[layer], 2 * RESIDUAL_SIZE, BATCHES * (2 * RESIDUAL_SIZE),
+                    RESIDUAL_SIZE, BATCH_SIZE,
+                    dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dBackwardTop + RESIDUAL_SIZE, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dForward + forwardLayerOffset + RESIDUAL_SIZE, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     1
                 );
+                // printDeviceTensor(
+                //     "residual swiglu grad %d",
+                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
+                //     dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, layer + 1
+                // );
+                
+                // swiglu gemm grad
+                cublasGemmEx(
+                    cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    RESIDUAL_SIZE, BATCH_SIZE, RESIDUAL_SIZE * SWIGLUS * 2,
+                    &ONE,
+                    dSwigluSumWeights + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
+                    dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
+                    &ZERO,
+                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
+                    CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
+                );
+                // printDeviceTensor(
+                //     "swiglu gemm grad norm %d",
+                //     RESIDUAL_SIZE, BATCH_SIZE,
+                //     dNorm, RESIDUAL_SIZE, layer
+                // );
+                
+                // batchnorm grad
+                batchNormGrad(
+                    RESIDUAL_SIZE, BATCH_SIZE,
+                    dNorm, RESIDUAL_SIZE, 0,
+                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    1
+                );
+                // printDeviceTensor(
+                //     "residual batchnorm grad %d",
+                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
+                //     dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, layer
+                // );
+                
+                // swiglu gemm weight grad
+                cublasGemmEx(
+                    cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
+                    RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE, BATCH_SIZE,
+                    &ONE,
+                    dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
+                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
+                    &ONE,
+                    dSwigluSumWeightGrads + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
+                    CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
+                );
+                // printDeviceTensor(
+                //     "swiglu gemm weight grad %d",
+                //     RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE,
+                //     dSwigluSumWeightGrads + swigluSumWeightLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, layer
+                // );
+                
+                // swap backward buffers
+                dBackwardTmp = dBackwardTop;
+                dBackwardTop = dBackwardBottom;
+                dBackwardBottom = dBackwardTmp;
             }
         }
         
@@ -198,6 +265,19 @@ int main() {
         }
         
         // apply gradients
+        adamUpdate(
+            RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE * LAYERS,
+            dSwigluSumWeightGrads, RESIDUAL_SIZE * SWIGLUS * 2,
+            dSwigluSumWeightGradMeans, RESIDUAL_SIZE * SWIGLUS * 2,
+            dSwigluSumWeightGradVars, RESIDUAL_SIZE * SWIGLUS * 2,
+            dSwigluSumWeights, RESIDUAL_SIZE * SWIGLUS * 2,
+            LR, MEAN_BETA, VAR_BETA, EPSILON
+        );
+        // printDeviceTensor(
+        //     "swiglu weights",
+        //     RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE * LAYERS,
+        //     dSwigluSumWeights, RESIDUAL_SIZE * SWIGLUS * 2
+        // );
     }
     time(&end_time);
     printf("Simulation time: %ld seconds\n", end_time - start_time);

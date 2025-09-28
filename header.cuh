@@ -343,3 +343,45 @@ void residualSwigluGrad(
         batches
     );
 }
+
+__global__ void adamUpdateKernel(
+    int width, int height,
+    const float *dWeightGradient, int gradStride,
+    float *dWeightGradMean, int gradMeanStride,
+    float *dWeightGradVar, int gradVarStride,
+    float *dWeights, int weightStride,
+    float lr, float meanBeta, float varBeta, float epsilon
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= width * height) return;
+    int y = idx / width;
+    int x = idx - y * width;
+    int meanIdx = y * gradMeanStride + x;
+    int varIdx = y * gradVarStride + x;
+    float grad = dWeightGradient[y * gradStride + x];
+    float mean = meanBeta * dWeightGradMean[meanIdx] + (1.0f - meanBeta) * grad;
+    float var = varBeta * dWeightGradVar[varIdx] + (1.0f - varBeta) * grad * grad;
+    dWeightGradMean[meanIdx] = mean;
+    dWeightGradVar[varIdx] = var;
+    dWeights[y * weightStride + x] += lr * mean * rsqrtf(var + epsilon);
+}
+
+void adamUpdate(
+    int width, int height,
+    const float *dWeightGradient, int gradStride,
+    float *dWeightGradMean, int gradMeanStride,
+    float *dWeightGradVar, int gradVarStride,
+    float *dWeights, int weightStride,
+    float lr, float meanBeta, float varBeta, float epsilon
+) {
+    int blockSize = 256;
+    int gridSize = (width * height + blockSize - 1) / blockSize;
+    adamUpdateKernel<<<gridSize, blockSize>>>(
+        width, height,
+        dWeightGradient, gradStride,
+        dWeightGradMean, gradMeanStride,
+        dWeightGradVar, gradVarStride,
+        dWeights, weightStride,
+        lr, meanBeta, varBeta, epsilon
+    );
+}
