@@ -1,14 +1,14 @@
 ﻿#include "header.cuh"
 
-#define LOG_SKIPS (1 * 16)
-#define EPOCHS (16 * 16)
+#define LOG_SKIPS (1 * 16 * 1)
+#define EPOCHS (16 * 16 * 1)
 #define BATCH_ITERATIONS 1
 #define BATCH_SIZE (16 * 16)
 
-#define INPUT_BITS 2
-#define RESIDUAL_SIZE 6
+#define INPUT_BITS 16
+#define RESIDUAL_SIZE 64
 #define SWIGLUS 1
-#define LAYERS 1
+#define LAYERS 4
 
 #define LR 0.01f
 #define MEAN_BETA 0.9f
@@ -42,8 +42,7 @@ int main() {
     normalRandFill(
         RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE * LAYERS,
         dSwigluSumWeights, RESIDUAL_SIZE * SWIGLUS * 2,
-        // seed, 0.0f, 0.02f
-        seed, 0.0f, rsqrtf(RESIDUAL_SIZE)
+        seed, 0.0f, 0.02f
     );
     
     time_t start_time, end_time;
@@ -64,11 +63,10 @@ int main() {
                     hInput[offset + bit] = (float)((a >> bit) & 1u);
                     hInput[offset + INPUT_BITS + bit] = (float)((b >> bit) & 1u);
                 }
-                // unsigned int sum = a + b;
-                // concat for identical input and target
-                unsigned int sum = b << INPUT_BITS | a;
+                unsigned int c = a + b;
+                // unsigned int c = b << INPUT_BITS | a;
                 for (int bit = 0; bit < INPUT_BITS * 2; bit++) {
-                    hOutput[offset + bit] = (float)((sum >> bit) & 1u);
+                    hOutput[offset + bit] = (float)((c >> bit) & 1u);
                 }
             }
             
@@ -101,7 +99,7 @@ int main() {
             // layered forward pass
             for (int layer = 0; layer < LAYERS; layer++) {
                 int forwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE * layer;
-                int nextForwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE * (layer + 1);
+                int nextForwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE + forwardLayerOffset;
                 int swigluSumWeightLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * layer;
                 
                 // batchnorm
@@ -135,11 +133,10 @@ int main() {
                 // );
                 
                 // residual swiglu sum
-                // TODO error in offset for swiglu
                 residualSwiglu(
                     RESIDUAL_SIZE, BATCH_SIZE,
                     dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     1
                 );
@@ -172,7 +169,7 @@ int main() {
             
             // accumulate loss
             if ((epoch + 1) % LOG_SKIPS == 0) {
-                float batchLoss;
+                float batchLoss = 0.0f;
                 cublasSdot(
                     cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
                     dBackwardTop, 1, dBackwardTop, 1, &batchLoss
@@ -183,19 +180,18 @@ int main() {
             // layered backward pass
             for (int layer = LAYERS; layer--;) {
                 int forwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE * layer;
-                int nextForwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE * (layer + 1);
+                int nextForwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE + forwardLayerOffset;
                 int swigluSumWeightLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * layer;
                 
                 // residual swiglu grad
-                // TODO error in offset for swiglu
                 residualSwigluGrad(
                     RESIDUAL_SIZE, BATCH_SIZE,
                     dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dBackwardTop + RESIDUAL_SIZE, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dBackwardTop + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + forwardLayerOffset + RESIDUAL_SIZE, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     1
                 );
                 // printDeviceTensor(
