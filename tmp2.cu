@@ -10,8 +10,8 @@
 #define SWIGLUS 1
 #define LAYERS (32 * 4)
 
-#define K 0.0001f
-#define LR 0.0006f
+#define K 10//0.0001f
+#define LR 0.00006f
 #define MEAN_BETA 0.9f
 #define VAR_BETA 0.999f
 #define EPSILON 1e-8f
