@@ -138,9 +138,9 @@ int main() {
                 
                 // residual swiglu sum
                 residualSwiglu(
-                    RESIDUAL_SIZE, BATCH_SIZE,
-                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    RESIDUAL_SIZE, BATCH_SIZE, SWIGLUS,
+                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
+                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
                     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     1
                 );
