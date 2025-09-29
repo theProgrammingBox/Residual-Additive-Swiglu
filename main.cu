@@ -1,7 +1,7 @@
 ﻿#include "header.cuh"
 
-#define LOG_SKIPS (16 * 16)
-#define EPOCHS (16 * 16 * 16)
+#define LOG_SKIPS (64 * 1)
+#define EPOCHS (1024 * 1)
 #define BATCH_ITERATIONS 1
 #define BATCH_SIZE (1024)
 
@@ -106,26 +106,29 @@ int main() {
                 int nextForwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE + forwardLayerOffset;
                 int swigluSumWeightLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * layer;
                 
-                // batchnorm
-                batchNorm(
-                    RESIDUAL_SIZE, BATCH_SIZE,
-                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dNorm, RESIDUAL_SIZE, 0,
-                    1
-                );
-                // printDeviceTensor(
-                //     "norm %d",
+                // // batchnorm
+                // batchNorm(
                 //     RESIDUAL_SIZE, BATCH_SIZE,
-                //     dNorm, RESIDUAL_SIZE, layer
+                //     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     dNorm, RESIDUAL_SIZE, 0,
+                //     1
                 // );
+                // // printDeviceTensor(
+                // //     "norm %d",
+                // //     RESIDUAL_SIZE, BATCH_SIZE,
+                // //     dNorm, RESIDUAL_SIZE, layer
+                // // );
                 
                 // swiglus gemm
+                float alpha = 1 - (1 - rsqrtf(layer + 1)) * expf(-K * epoch);
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
                     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE, RESIDUAL_SIZE,
-                    &ONE,
+                    // &ONE,
+                    &alpha,
                     dSwigluSumWeights + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
+                    // dNorm, CUDA_R_32F, RESIDUAL_SIZE,
+                    dForward + forwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     &ZERO,
                     dForward + nextForwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
@@ -138,9 +141,9 @@ int main() {
                 
                 // residual swiglu sum
                 residualSwiglu(
-                    RESIDUAL_SIZE, BATCH_SIZE, SWIGLUS,
-                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
-                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
+                    RESIDUAL_SIZE, BATCH_SIZE,
+                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     1
                 );
@@ -216,14 +219,17 @@ int main() {
                 // );
                 
                 // swiglu gemm grad
+                float alpha = 1 - (1 - rsqrtf(layer + 1)) * expf(-K * epoch);
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
                     RESIDUAL_SIZE, BATCH_SIZE, RESIDUAL_SIZE * SWIGLUS * 2,
-                    &ONE,
+                    &alpha,
                     dSwigluSumWeights + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    &ZERO,
-                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
+                    // &ZERO,
+                    // dNorm, CUDA_R_32F, RESIDUAL_SIZE,
+                    &ONE,
+                    dBackwardBottom, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
                 );
                 // printDeviceTensor(
@@ -232,27 +238,28 @@ int main() {
                 //     dNorm, RESIDUAL_SIZE, layer
                 // );
                 
-                // batchnorm grad
-                batchNormGrad(
-                    RESIDUAL_SIZE, BATCH_SIZE,
-                    dNorm, RESIDUAL_SIZE, 0,
-                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    1
-                );
-                // printDeviceTensor(
-                //     "residual batchnorm grad %d",
-                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                //     dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, layer
+                // // batchnorm grad
+                // batchNormGrad(
+                //     RESIDUAL_SIZE, BATCH_SIZE,
+                //     dNorm, RESIDUAL_SIZE, 0,
+                //     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     1
                 // );
+                // // printDeviceTensor(
+                // //     "residual batchnorm grad %d",
+                // //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
+                // //     dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, layer
+                // // );
                 
                 // swiglu gemm weight grad
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
                     RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE, BATCH_SIZE,
-                    &ONE,
+                    &LR_SCALE,
                     dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
+                    // dNorm, CUDA_R_32F, RESIDUAL_SIZE,
+                    dForward + forwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     &ONE,
                     dSwigluSumWeightGrads + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
