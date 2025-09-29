@@ -2,12 +2,12 @@
 
 #define LOG_SKIPS (64 * 1)
 #define EPOCHS (1024 * 1)
-#define BATCH_ITERATIONS 1
+#define BATCH_ITERATIONS (1)
 #define BATCH_SIZE (1024)
 
-#define INPUT_BITS 16
-#define RESIDUAL_SIZE 256
-#define SWIGLUS 1
+#define INPUT_BITS (16)
+#define RESIDUAL_SIZE (256)
+#define SWIGLUS (1)
 #define LAYERS (32 * 16)
 
 #define K 0.0001f
@@ -137,13 +137,20 @@ int main() {
                 // );
                 
                 // residual swiglu sum
-                residualSwiglu(
+                residualSwigluSum(
                     RESIDUAL_SIZE, BATCH_SIZE, SWIGLUS,
                     dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
                     dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
                     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     1
                 );
+                // residualSwiglu(
+                //     RESIDUAL_SIZE, BATCH_SIZE,
+                //     dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     1
+                // );
                 // printDeviceTensor(
                 //     "residual swiglu %d",
                 //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
@@ -199,16 +206,26 @@ int main() {
                 int swigluSumWeightLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * layer;
                 
                 // residual swiglu grad
-                residualSwigluGrad(
-                    RESIDUAL_SIZE, BATCH_SIZE,
-                    dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dBackwardTop + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                residualSwigluSumGrad(
+                    RESIDUAL_SIZE, BATCH_SIZE, SWIGLUS,
+                    dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
+                    dBackwardTop + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
                     dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
+                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
                     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
                     1
                 );
+                // residualSwigluGrad(
+                //     RESIDUAL_SIZE, BATCH_SIZE,
+                //     dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     dBackwardTop + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                //     1
+                // );
                 // printDeviceTensor(
                 //     "residual swiglu grad %d",
                 //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
@@ -250,7 +267,8 @@ int main() {
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
                     RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE, BATCH_SIZE,
-                    &ONE,
+                    // &ONE,
+                    &LR_SCALE,
                     dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     dNorm, CUDA_R_32F, RESIDUAL_SIZE,
                     &ONE,

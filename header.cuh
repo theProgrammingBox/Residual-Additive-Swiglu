@@ -1,305 +1,494 @@
-#include "header.cuh"
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <cstdarg>
+#include <assert.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
 
-#define LOG_SKIPS (64 * 1)
-#define EPOCHS (1024 * 1)
-#define BATCH_ITERATIONS 1
-#define BATCH_SIZE (1024)
+int hashI32(int& seed) {
+    seed += 0xe6546b64;
+    seed ^= seed >> 16;
+    seed *= 0x85ebca6b;
+    seed ^= seed >> 13;
+    seed *= 0xc2b2ae35;
+    seed ^= seed >> 16;
+    return seed;
+}
 
-#define INPUT_BITS 16
-#define RESIDUAL_SIZE 256
-#define SWIGLUS 1
-#define LAYERS (32 * 16)
+float hashF32(int& seed, float min = 0.0f, float max = 1.0f) {
+    return min + (hashI32(seed) & 0x7fffffff) * (max - min) * 0.0000000004656613f;
+}
 
-#define K 0.0001f
-#define LR 0.001f
-#define MEAN_BETA 0.9f
-#define VAR_BETA 0.999f
-#define EPSILON 1e-8f
-
-int main() {
-    assert(INPUT_BITS > 0 && INPUT_BITS <= 16);
-    
-    int seed = 0;
-    cublasHandle_t cublasHandle;
-    cublasCreate(&cublasHandle);
-    const float ONE = 1.0f;
-    const float ZERO = 0.0f;
-    const float NEG_ONE = -1.0f;
-    const float LR_SCALE = 1.0f / (INPUT_BITS * 2 * BATCH_SIZE * BATCH_ITERATIONS);
-    
-    float *hInput = (float*)malloc((INPUT_BITS * 2) * BATCH_SIZE * sizeof(float));
-    float *hOutput = (float*)malloc((INPUT_BITS * 2) * BATCH_SIZE * sizeof(float));
-    
-    float* dForward = callocDeviceTensor<float>(RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE * (LAYERS + 1));
-    float* dNorm = mallocDeviceTensor<float>(RESIDUAL_SIZE * BATCH_SIZE);
-    
-    float* dBackwardTop = mallocDeviceTensor<float>(RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE);
-    float* dBackwardBottom = mallocDeviceTensor<float>(RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE);
-    float* dBackwardTmp;
-    
-    float* dSwigluSumWeights = mallocDeviceTensor<float>(RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * LAYERS);
-    float* dSwigluSumWeightGrads = mallocDeviceTensor<float>(RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * LAYERS);
-    float* dSwigluSumWeightGradMeans = callocDeviceTensor<float>(RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * LAYERS);
-    float* dSwigluSumWeightGradVars = callocDeviceTensor<float>(RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * LAYERS);
-    normalRandFill(
-        RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE * LAYERS,
-        dSwigluSumWeights, RESIDUAL_SIZE * SWIGLUS * 2,
-        // seed, 0.0f, 0.02f
-        seed, 0.0f, rsqrtf(RESIDUAL_SIZE)
-    );
-    
-    time_t start_time, end_time;
-    time(&start_time);
-    for (int epoch = 0; epoch < EPOCHS; epoch++) {
-        // reset gradients
-        cudaMemset(dSwigluSumWeightGrads, 0, RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * LAYERS * sizeof(float));
-        
-        float totalLoss = 0.0f;
-        float totalError = 0.0f;
-        for (int batchIteration = 0; batchIteration < BATCH_ITERATIONS; batchIteration++) {
-            // Fill input data
-            unsigned int mask = (1u << INPUT_BITS) - 1u;
-            for (int batch = 0; batch < BATCH_SIZE; batch++) {
-                unsigned int a = (unsigned int)hashI32(seed) & mask;
-                unsigned int b = (unsigned int)hashI32(seed) & mask;
-                int offset = batch * (INPUT_BITS * 2);
-                for (int bit = 0; bit < INPUT_BITS; bit++) {
-                    hInput[offset + bit] = (float)((a >> bit) & 1u);
-                    hInput[offset + INPUT_BITS + bit] = (float)((b >> bit) & 1u);
-                }
-                unsigned int c = a + b;
-                // unsigned int c = b << INPUT_BITS | a;
-                for (int bit = 0; bit < INPUT_BITS * 2; bit++) {
-                    hOutput[offset + bit] = (float)((c >> bit) & 1u);
-                }
-            }
-            
-            // copy input to device
-            cudaMemcpy2D(
-                dForward, RESIDUAL_SIZE * SWIGLUS * 2 * sizeof(float),
-                hInput, INPUT_BITS * 2 * sizeof(float),
-                INPUT_BITS * 2 * sizeof(float), BATCH_SIZE,
-                cudaMemcpyHostToDevice
-            );
-            // printDeviceTensor(
-            //     "input, only first %d used",
-            //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-            //     dForward, RESIDUAL_SIZE * SWIGLUS * 2, INPUT_BITS * 2
-            // );
-            
-            // copy output to device
-            cudaMemcpy2D(
-                dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2 * sizeof(float),
-                hOutput, INPUT_BITS * 2 * sizeof(float),
-                INPUT_BITS * 2 * sizeof(float), BATCH_SIZE,
-                cudaMemcpyHostToDevice
-            );
-            // printDeviceTensor(
-            //     "target, only first %d used",
-            //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-            //     dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, INPUT_BITS * 2
-            // );
-            
-            // layered forward pass
-            for (int layer = 0; layer < LAYERS; layer++) {
-                int forwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE * layer;
-                int nextForwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE + forwardLayerOffset;
-                int swigluSumWeightLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * layer;
-                
-                // batchnorm
-                batchNorm(
-                    RESIDUAL_SIZE, BATCH_SIZE,
-                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dNorm, RESIDUAL_SIZE, 0,
-                    1
-                );
-                // printDeviceTensor(
-                //     "norm %d",
-                //     RESIDUAL_SIZE, BATCH_SIZE,
-                //     dNorm, RESIDUAL_SIZE, layer
-                // );
-                
-                // swiglus gemm
-                cublasGemmEx(
-                    cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
-                    RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE, RESIDUAL_SIZE,
-                    &ONE,
-                    dSwigluSumWeights + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
-                    &ZERO,
-                    dForward + nextForwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
-                );
-                // printDeviceTensor(
-                //     "swiglu gemm %d",
-                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                //     dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, layer + 1
-                // );
-                
-                // residual swiglu sum
-                // residualSwiglu(
-                //     RESIDUAL_SIZE, BATCH_SIZE, SWIGLUS,
-                //     dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
-                //     dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0, RESIDUAL_SIZE,
-                //     dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                //     1
-                // );
-                residualSwiglu(
-                    RESIDUAL_SIZE, BATCH_SIZE,
-                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    1
-                );
-                // printDeviceTensor(
-                //     "residual swiglu %d",
-                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                //     dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, layer + 1
-                // );
-            }
-            
-            // get error and clear unused part of backward top
-            cublasSgeam(
-                cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
-                INPUT_BITS * 2, BATCH_SIZE,
-                &NEG_ONE,
-                dForward + RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE * LAYERS, RESIDUAL_SIZE * SWIGLUS * 2,
-                &ONE,
-                dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2,
-                dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2
-            );
-            cudaMemset2D(
-                dBackwardTop + INPUT_BITS * 2, RESIDUAL_SIZE * SWIGLUS * 2 * sizeof(float),
-                0, (RESIDUAL_SIZE * SWIGLUS * 2 - INPUT_BITS * 2) * sizeof(float), BATCH_SIZE
-            );
-            // printDeviceTensor(
-            //     "error, only first %d used",
-            //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-            //     dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, INPUT_BITS * 2
-            // );
-            
-            // accumulate loss
-            if ((epoch + 1) % LOG_SKIPS == 0) {
-                float batchLoss = 0.0f;
-                float batchError = 0.0f;
-                cublasSdot(
-                    cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
-                    dBackwardTop, 1, dBackwardTop, 1, &batchLoss
-                );
-                // cublasSasum(
-                //     cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
-                //     dBackwardTop, 1, &batchError
-                // );
-                cublasNrm2Ex(
-                    cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
-                    dBackwardTop, CUDA_R_32F, 1,
-                    &batchError, CUDA_R_32F, CUDA_R_32F
-                );
-                totalLoss += batchLoss;
-                totalError += batchError;
-            }
-            
-            // layered backward pass
-            for (int layer = LAYERS; layer--;) {
-                int forwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE * layer;
-                int nextForwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE + forwardLayerOffset;
-                int swigluSumWeightLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * layer;
-                
-                // residual swiglu grad
-                residualSwigluGrad(
-                    RESIDUAL_SIZE, BATCH_SIZE,
-                    dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dBackwardTop + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + nextForwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + nextForwardLayerOffset + RESIDUAL_SIZE * SWIGLUS, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    1
-                );
-                // printDeviceTensor(
-                //     "residual swiglu grad %d",
-                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                //     dBackwardTop, RESIDUAL_SIZE * SWIGLUS * 2, layer + 1
-                // );
-                
-                // swiglu gemm grad
-                cublasGemmEx(
-                    cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
-                    RESIDUAL_SIZE, BATCH_SIZE, RESIDUAL_SIZE * SWIGLUS * 2,
-                    &ONE,
-                    dSwigluSumWeights + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    &ZERO,
-                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
-                    CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
-                );
-                // printDeviceTensor(
-                //     "swiglu gemm grad norm %d",
-                //     RESIDUAL_SIZE, BATCH_SIZE,
-                //     dNorm, RESIDUAL_SIZE, layer
-                // );
-                
-                // batchnorm grad
-                batchNormGrad(
-                    RESIDUAL_SIZE, BATCH_SIZE,
-                    dNorm, RESIDUAL_SIZE, 0,
-                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
-                    1
-                );
-                // printDeviceTensor(
-                //     "residual batchnorm grad %d",
-                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
-                //     dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, layer
-                // );
-                
-                // swiglu gemm weight grad
-                cublasGemmEx(
-                    cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
-                    RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE, BATCH_SIZE,
-                    &ONE,
-                    dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
-                    &ONE,
-                    dSwigluSumWeightGrads + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
-                );
-                // printDeviceTensor(
-                //     "swiglu gemm weight grad %d",
-                //     RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE,
-                //     dSwigluSumWeightGrads + swigluSumWeightLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, layer
-                // );
-                
-                // swap backward buffers
-                dBackwardTmp = dBackwardTop;
-                dBackwardTop = dBackwardBottom;
-                dBackwardBottom = dBackwardTmp;
-            }
+void printHostTensor(
+    const char *name,
+    int width, int height,
+    const float *hostTensor, int stride,
+    ...
+) {
+    va_list args;
+    va_start(args, stride);
+    vprintf(name, args);
+    va_end(args);
+    printf(":\n");
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            printf("%.3f ", hostTensor[y * width + x]);
         }
-        
-        // log loss
-        if ((epoch + 1) % LOG_SKIPS == 0) {
-            // printf("Epoch %u: loss %.6f, error %.6f\n", epoch + 1, 0.5f * totalLoss * LR_SCALE, totalError * LR_SCALE);
-            printf("Epoch %u: loss %.6f, error %.6f\n", epoch + 1, 0.5f * totalLoss * LR_SCALE, totalError * rsqrtf(BATCH_SIZE * INPUT_BITS * 2));
-        }
-        
-        // apply gradients
-        adamUpdate(
-            RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE * LAYERS,
-            dSwigluSumWeightGrads, RESIDUAL_SIZE * SWIGLUS * 2,
-            dSwigluSumWeightGradMeans, RESIDUAL_SIZE * SWIGLUS * 2,
-            dSwigluSumWeightGradVars, RESIDUAL_SIZE * SWIGLUS * 2,
-            dSwigluSumWeights, RESIDUAL_SIZE * SWIGLUS * 2,
-            LR, MEAN_BETA, VAR_BETA, EPSILON
-        );
-        // printDeviceTensor(
-        //     "swiglu weights",
-        //     RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE * LAYERS,
-        //     dSwigluSumWeights, RESIDUAL_SIZE * SWIGLUS * 2
-        // );
+        printf("\n");
     }
-    time(&end_time);
-    printf("Simulation time: %ld seconds\n", end_time - start_time);
+}
+
+void printDeviceTensor(
+    const char *name,
+    int width, int height,
+    const float *deviceTensor, int stride,
+    ...
+) {
+    float *hostTensor = (float*)malloc(width * height * sizeof(float));
+    cudaMemcpy2D(
+        hostTensor, width * sizeof(float),
+        deviceTensor, stride * sizeof(float),
+        width * sizeof(float), height,
+        cudaMemcpyDeviceToHost
+    );
+    va_list args;
+    va_start(args, stride);
+    vprintf(name, args);
+    va_end(args);
+    printf(":\n");
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            printf("%.3f ", hostTensor[y * width + x]);
+        }
+        printf("\n");
+    }
+    free(hostTensor);
+}
+
+__global__ void randNormalKernel(
+    int width, int height,
+    float *dTensor, int stride,
+    int seed, float mean, float std
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= width * height) return;
+    seed += idx * 0xe6546b64;
+    seed ^= seed >> 16;
+    seed *= 0x85ebca6b;
+    seed ^= seed >> 13;
+    seed *= 0xc2b2ae35;
+    seed ^= seed >> 16;
+    int y = idx / width;
+    int x = idx - y * width;
+    float u1 = (seed & 0xffff) * 0.0000152587890625f;
+    float u2 = ((seed >> 16) & 0xffff) * 0.0000152587890625f;
+    float r = sqrtf(-2.0f * logf(u1 + 1e-8f)) * cosf(6.283185307179586f * u2);
+    dTensor[y * stride + x] = r * std + mean;
+}
+
+void normalRandFill(
+    int width, int height,
+    float *dTensor, int stride,
+    int &seed, float mean, float std
+) {
+    int blockSize = 256;
+    int gridSize = (width * height + blockSize - 1) / blockSize;
+    randNormalKernel<<<gridSize, blockSize>>>(
+        width, height,
+        dTensor, stride,
+        hashI32(seed), mean, std
+    );
+}
+
+__global__ void randUniformKernel(
+    int width, int height,
+    float *dTensor, int stride,
+    int seed, float min, float max
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= width * height) return;
+    seed += idx * 0xe6546b64;
+    seed ^= seed >> 16;
+    seed *= 0x85ebca6b;
+    seed ^= seed >> 13;
+    seed *= 0xc2b2ae35;
+    seed ^= seed >> 16;
+    int y = idx / width;
+    int x = idx - y * width;
+    float u1 = (seed & 0xffff) * 0.0000152587890625f;
+    dTensor[y * stride + x] = u1 * (max - min) + min;
+}
+
+void uniformRandFill(
+    int width, int height,
+    float *dTensor, int stride,
+    int &seed, float min = 0.0f, float max = 1.0f
+) {
+    int blockSize = 256;
+    int gridSize = (width * height + blockSize - 1) / blockSize;
+    randUniformKernel<<<gridSize, blockSize>>>(
+        width, height,
+        dTensor, stride,
+        hashI32(seed), min, max
+    );
+}
+
+template<typename T>
+T* mallocDeviceTensor(int size) {
+    T *deviceTensor;
+    cudaMalloc(&deviceTensor, size * sizeof(T));
+    return deviceTensor;
+}
+
+template<typename T>
+T* callocDeviceTensor(int size) {
+    T *deviceTensor = mallocDeviceTensor<T>(size);
+    cudaMemset(deviceTensor, 0, size * sizeof(T));
+    return deviceTensor;
+}
+
+__global__ void batchNormKernel(
+    int width, int height,
+    const float *dInput, int inputStride, int inputBatchStride,
+    float *dNorm, int normStride, int normBatchStride
+) {
+    __shared__ float sTmp[32];
+    int lane = threadIdx.x & 31;
+    int warpId = threadIdx.x >> 5;
+    int batch = blockIdx.x / width;
+    int x = blockIdx.x - width * batch;
+    float val = threadIdx.x < height ? dInput[batch * inputBatchStride + threadIdx.x * inputStride + x] : 0.0f;
+    float sum = val * val;
+    #pragma unroll
+    for (int i = 16; i > 0; i >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, i);
+    if (lane == 0) sTmp[warpId] = sum;
+    __syncthreads();
+    if (warpId == 0) {
+        sum = sTmp[lane];
+        #pragma unroll
+        for (int i = 16; i > 0; i >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, i);
+        if (lane == 0) sTmp[0] = rsqrtf(sum / height + 1e-8f);
+    }
+    __syncthreads();
+    if (threadIdx.x < height) dNorm[batch * normBatchStride + threadIdx.x * normStride + x] = val * sTmp[0];
+}
+
+void batchNorm(
+    int width, int height,
+    const float *dInput, int inputStride, int inputBatchStride,
+    float *dNorm, int normStride, int normBatchStride,
+    int batches
+) {
+    assert(height <= 1024);
+    int blockSize = 1024;
+    int gridSize = width * batches;
+    batchNormKernel<<<gridSize, blockSize>>>(
+        width, height,
+        dInput, inputStride, inputBatchStride,
+        dNorm, normStride, normBatchStride
+    );
+}
+
+__global__ void batchNormGradKernel(
+    int width, int height,
+    float *dNormal, int normalStride, int normalBatchStride,
+    float *dInput, int inputStride, int inputBatchStride,
+    float *dOutputGrad, int outputGradStride, int outputGradBatchStride
+) {
+    __shared__ float sTmp[32];
+    __shared__ float sTmp2[32];
+    int tid = threadIdx.x;
+    uint8_t lane = tid & 31;
+    uint8_t warpId = tid >> 5;
+    int batch = blockIdx.x / width;
+    int x = blockIdx.x - width * batch;
+    float val = (tid < height) ? dInput[batch * inputBatchStride + tid * inputStride + x] : 0.0f;
+    float grad = (tid < height) ? dNormal[batch * normalBatchStride + tid * normalStride + x] : 0.0f;
+    float sum = val * val;
+    float sum2 = grad * val;
+    #pragma unroll
+    for (int i = 16; i > 0; i >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, i);
+        sum2 += __shfl_down_sync(0xFFFFFFFF, sum2, i);
+    }
+    if (lane == 0) {
+        sTmp[warpId] = sum;
+        sTmp2[warpId] = sum2;
+    }
+    __syncthreads();
+    if (warpId == 0) {
+        sum = sTmp[lane];
+        sum2 = sTmp2[lane];
+        #pragma unroll
+        for (int i = 16; i > 0; i >>= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, i);
+            sum2 += __shfl_down_sync(0xFFFFFFFF, sum2, i);
+        }
+        if (lane == 0) {
+            sTmp[0] = rsqrtf(sum / height + 1e-8f);
+            sTmp2[0] = sum2 / height;
+        }
+    }
+    __syncthreads();
+    if (tid < height) {
+        dOutputGrad[batch * outputGradBatchStride + tid * outputGradStride + x] +=
+            (grad - val * sTmp2[0] * sTmp[0] * sTmp[0]) * sTmp[0];
+        dNormal[batch * normalBatchStride + tid * normalStride + x] = val * sTmp[0];
+    }
+}
+
+void batchNormGrad(
+    int width, int height,
+    float *dNormal, int normalStride, int normalBatchStride,
+    float *dInput, int inputStride, int inputBatchStride,
+    float *dOutputGrad, int outputGradStride, int outputGradBatchStride,
+    int batches
+) {
+    assert(height <= 1024);
+    int blockSize = 1024;
+    int gridSize = width * batches;
+    batchNormGradKernel<<<gridSize, blockSize>>>(
+        width, height,
+        dNormal, normalStride, normalBatchStride,
+        dInput, inputStride, inputBatchStride,
+        dOutputGrad, outputGradStride, outputGradBatchStride
+    );
+}
+
+__global__ void residualSwigluSumKernel(
+    int width, int height, int swiglus,
+    float *dInput, int inputStride, int inputBatchStride, int inputSwigluStride,
+    float *dLogit, int logitStride, int logitBatchStride, int logitSwigluStride,
+    float *dResidual, int residualStride, int residualBatchStride,
+    int batches
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= width * height * batches) return;
+    int y = idx / width;
+    int x = idx - y * width;
+    int batch = y / height;
+    y -= batch * height;
+    float sum = 0;
+    for (int s = 1; s < swiglus; s++) {
+        float val = dInput[batch * inputBatchStride + y * inputStride + x + s * inputSwigluStride];
+        float logit = dLogit[batch * logitBatchStride + y * logitStride + x + s * logitSwigluStride];
+        float sigmoid = 1.0f / (1.0f + expf(-logit));
+        float swiglu = val * sigmoid;
+        sum += swiglu;
+        dInput[batch * inputBatchStride + y * inputStride + x + s * inputSwigluStride] = swiglu;
+        dLogit[batch * logitBatchStride + y * logitStride + x + s * logitSwigluStride] = sigmoid;
+    }
+    float val = dInput[batch * inputBatchStride + y * inputStride + x];
+    float logit = dLogit[batch * logitBatchStride + y * logitStride + x];
+    float bias = dResidual[batch * residualBatchStride + y * residualStride + x];
+    float sigmoid = 1.0f / (1.0f + expf(-logit));
+    dInput[batch * inputBatchStride + y * inputStride + x] = val * sigmoid + bias + sum;
+    dLogit[batch * logitBatchStride + y * logitStride + x] = sigmoid;
+}
+
+void residualSwigluSum(
+    int width, int height, int swiglus,
+    float *dInput, int inputStride, int inputBatchStride, int inputSwigluStride,
+    float *dLogit, int logitStride, int logitBatchStride, int logitSwigluStride,
+    float *dResidual, int residualStride, int residualBatchStride,
+    int batches
+) {
+    int blockSize = 256;
+    int gridSize = (width * height * batches + blockSize - 1) / blockSize;
+    residualSwigluSumKernel<<<gridSize, blockSize>>>(
+        width, height, swiglus,
+        dInput, inputStride, inputBatchStride, inputSwigluStride,
+        dLogit, logitStride, logitBatchStride, logitSwigluStride,
+        dResidual, residualStride, residualBatchStride,
+        batches
+    );
+}
+
+__global__ void residualSwigluSumGradKernel(
+    int width, int height, int swiglus,
+    float *dOutputGrad, int outputGradStride, int outputGradBatchStride, int outputGradSwigluStride,
+    float *dLogitGrad, int logitGradStride, int logitGradBatchStride, int logitGradSwigluStride,
+    float *dResidualGrad, int residualGradStride, int residualGradBatchStride,
+    float *dOutput, int outputStride, int outputBatchStride, int outputSwigluStride,
+    float *dSigmoid, int sigmoidStride, int sigmoidBatchStride, int sigmoidSwigluStride,
+    float *dResidual, int residualStride, int residualBatchStride,
+    int batches
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= width * height * batches) return;
+    int y = idx / width;
+    int x = idx - y * width;
+    int batch = y / height;
+    y -= batch * height;
     
-    return 0;
+    float grad = dOutputGrad[batch * outputGradBatchStride + y * outputGradStride + x];
+    float sum = 0;
+    for (int s = 1; s < swiglus; s++) {
+        float swiglu = dOutput[batch * outputBatchStride + y * outputStride + x + s * outputSwigluStride];
+        float sigmoid = dSigmoid[batch * sigmoidBatchStride + y * sigmoidStride + x + s * sigmoidSwigluStride];
+        sum += swiglu;
+        dOutputGrad[batch * outputGradBatchStride + y * outputGradStride + x + s * outputGradSwigluStride] = grad * sigmoid;
+        dLogitGrad[batch * logitGradBatchStride + y * logitGradStride + x + s * logitGradSwigluStride] = grad * swiglu * (1.0f - sigmoid);
+    }
+    float swiglu = dOutput[batch * outputBatchStride + y * outputStride + x];
+    float sigmoid = dSigmoid[batch * sigmoidBatchStride + y * sigmoidStride + x];
+    float bias = dResidual[batch * residualBatchStride + y * residualStride + x];
+    dOutputGrad[batch * outputGradBatchStride + y * outputGradStride + x] = grad * sigmoid;
+    dLogitGrad[batch * logitGradBatchStride + y * logitGradStride + x] = grad * (swiglu - bias - sum) * (1.0f - sigmoid);
+    dResidualGrad[batch * residualGradBatchStride + y * residualGradStride + x] = grad;
+}
+
+void residualSwigluSumGrad(
+    int width, int height, int swiglus,
+    float *dOutputGrad, int outputGradStride, int outputGradBatchStride, int outputGradSwigluStride,
+    float *dLogitGrad, int logitGradStride, int logitGradBatchStride, int logitGradSwigluStride,
+    float *dResidualGrad, int residualGradStride, int residualGradBatchStride,
+    float *dOutput, int outputStride, int outputBatchStride, int outputSwigluStride,
+    float *dSigmoid, int sigmoidStride, int sigmoidBatchStride, int sigmoidSwigluStride,
+    float *dResidual, int residualStride, int residualBatchStride,
+    int batches
+) {
+    int blockSize = 256;
+    int gridSize = (width * height * batches + blockSize - 1) / blockSize;
+    residualSwigluSumGradKernel<<<gridSize, blockSize>>>(
+        width, height, swiglus,
+        dOutputGrad, outputGradStride, outputGradBatchStride, outputGradSwigluStride,
+        dLogitGrad, logitGradStride, logitGradBatchStride, logitGradSwigluStride,
+        dResidualGrad, residualGradStride, residualGradBatchStride,
+        dOutput, outputStride, outputBatchStride, outputSwigluStride,
+        dSigmoid, sigmoidStride, sigmoidBatchStride, sigmoidSwigluStride,
+        dResidual, residualStride, residualBatchStride,
+        batches
+    );
+}
+
+__global__ void residualSwigluKernel(
+    int width, int height,
+    float *dInput, int inputStride, int inputBatchStride,
+    float *dLogit, int logitStride, int logitBatchStride,
+    float *dResidual, int residualStride, int residualBatchStride,
+    int batches
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= width * height * batches) return;
+    int y = idx / width;
+    int x = idx - y * width;
+    int batch = y / height;
+    y -= batch * height;
+    float val = dInput[batch * inputBatchStride + y * inputStride + x];
+    float logit = dLogit[batch * logitBatchStride + y * logitStride + x];
+    float bias = dResidual[batch * residualBatchStride + y * residualStride + x];
+    float sigmoid = 1.0f / (1.0f + expf(-logit));
+    dInput[batch * inputBatchStride + y * inputStride + x] = val * sigmoid + bias;
+    dLogit[batch * logitBatchStride + y * logitStride + x] = sigmoid;
+}
+
+void residualSwiglu(
+    int width, int height,
+    float *dInput, int inputStride, int inputBatchStride,
+    float *dLogit, int logitStride, int logitBatchStride,
+    float *dResidual, int residualStride, int residualBatchStride,
+    int batches
+) {
+    int blockSize = 256;
+    int gridSize = (width * height * batches + blockSize - 1) / blockSize;
+    residualSwigluKernel<<<gridSize, blockSize>>>(
+        width, height,
+        dInput, inputStride, inputBatchStride,
+        dLogit, logitStride, logitBatchStride,
+        dResidual, residualStride, residualBatchStride,
+        batches
+    );
+}
+
+__global__ void residualSwigluGradKernel(
+    int width, int height,
+    float *dOutputGrad, int outputGradStride, int outputGradBatchStride,
+    float *dLogitGrad, int logitGradStride, int logitGradBatchStride,
+    float *dResidualGrad, int residualGradStride, int residualGradBatchStride,
+    float *dOutput, int outputStride, int outputBatchStride,
+    float *dSigmoid, int sigmoidStride, int sigmoidBatchStride,
+    float *dResidual, int residualStride, int residualBatchStride,
+    int batches
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= width * height * batches) return;
+    int y = idx / width;
+    int x = idx - y * width;
+    int batch = y / height;
+    y -= batch * height;
+    float swiglu = dOutput[batch * outputBatchStride + y * outputStride + x];
+    float sigmoid = dSigmoid[batch * sigmoidBatchStride + y * sigmoidStride + x];
+    float bias = dResidual[batch * residualBatchStride + y * residualStride + x];
+    float grad = dOutputGrad[batch * outputGradBatchStride + y * outputGradStride + x];
+    dOutputGrad[batch * outputGradBatchStride + y * outputGradStride + x] = grad * sigmoid;
+    dLogitGrad[batch * logitGradBatchStride + y * logitGradStride + x] = grad * (swiglu - bias) * (1.0f - sigmoid);
+    dResidualGrad[batch * residualGradBatchStride + y * residualGradStride + x] = grad;
+}
+
+void residualSwigluGrad(
+    int width, int height,
+    float *dOutputGrad, int outputGradStride, int outputGradBatchStride,
+    float *dLogitGrad, int logitGradStride, int logitGradBatchStride,
+    float *dResidualGrad, int residualGradStride, int residualGradBatchStride,
+    float *dOutput, int outputStride, int outputBatchStride,
+    float *dSigmoid, int sigmoidStride, int sigmoidBatchStride,
+    float *dResidual, int residualStride, int residualBatchStride,
+    int batches
+) {
+    int blockSize = 256;
+    int gridSize = (width * height * batches + blockSize - 1) / blockSize;
+    residualSwigluGradKernel<<<gridSize, blockSize>>>(
+        width, height,
+        dOutputGrad, outputGradStride, outputGradBatchStride,
+        dLogitGrad, logitGradStride, logitGradBatchStride,
+        dResidualGrad, residualGradStride, residualGradBatchStride,
+        dOutput, outputStride, outputBatchStride,
+        dSigmoid, sigmoidStride, sigmoidBatchStride,
+        dResidual, residualStride, residualBatchStride,
+        batches
+    );
+}
+
+__global__ void adamUpdateKernel(
+    int width, int height,
+    const float *dWeightGradient, int gradStride,
+    float *dWeightGradMean, int gradMeanStride,
+    float *dWeightGradVar, int gradVarStride,
+    float *dWeights, int weightStride,
+    float lr, float meanBeta, float varBeta, float epsilon
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= width * height) return;
+    int y = idx / width;
+    int x = idx - y * width;
+    int meanIdx = y * gradMeanStride + x;
+    int varIdx = y * gradVarStride + x;
+    float grad = dWeightGradient[y * gradStride + x];
+    float mean = meanBeta * dWeightGradMean[meanIdx] + (1.0f - meanBeta) * grad;
+    float var = varBeta * dWeightGradVar[varIdx] + (1.0f - varBeta) * grad * grad;
+    dWeightGradMean[meanIdx] = mean;
+    dWeightGradVar[varIdx] = var;
+    dWeights[y * weightStride + x] += lr * mean * rsqrtf(var + epsilon);
+}
+
+void adamUpdate(
+    int width, int height,
+    const float *dWeightGradient, int gradStride,
+    float *dWeightGradMean, int gradMeanStride,
+    float *dWeightGradVar, int gradVarStride,
+    float *dWeights, int weightStride,
+    float lr, float meanBeta, float varBeta, float epsilon
+) {
+    int blockSize = 256;
+    int gridSize = (width * height + blockSize - 1) / blockSize;
+    adamUpdateKernel<<<gridSize, blockSize>>>(
+        width, height,
+        dWeightGradient, gradStride,
+        dWeightGradMean, gradMeanStride,
+        dWeightGradVar, gradVarStride,
+        dWeights, weightStride,
+        lr, meanBeta, varBeta, epsilon
+    );
 }
