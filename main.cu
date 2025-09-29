@@ -1,15 +1,16 @@
 ﻿#include "header.cuh"
 
-#define LOG_SKIPS (64 * 4)
-#define EPOCHS (1024 * 4)
+#define LOG_SKIPS (16 * 16)
+#define EPOCHS (16 * 16 * 16)
 #define BATCH_ITERATIONS 1
 #define BATCH_SIZE (1024)
 
 #define INPUT_BITS 16
 #define RESIDUAL_SIZE 256
 #define SWIGLUS 1
-#define LAYERS 32
+#define LAYERS (32 * 16)
 
+#define K 0.0001f
 #define LR 0.001f
 #define MEAN_BETA 0.9f
 #define VAR_BETA 0.999f
@@ -119,10 +120,12 @@ int main() {
                 // // );
                 
                 // swiglus gemm
+                float alpha = 1 - (1 - rsqrtf(layer + 1)) * expf(-K * epoch);
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
                     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE, RESIDUAL_SIZE,
-                    &ONE,
+                    // &ONE,
+                    &alpha,
                     dSwigluSumWeights + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     // dNorm, CUDA_R_32F, RESIDUAL_SIZE,
                     dForward + forwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
@@ -216,10 +219,11 @@ int main() {
                 // );
                 
                 // swiglu gemm grad
+                float alpha = 1 - (1 - rsqrtf(layer + 1)) * expf(-K * epoch);
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
                     RESIDUAL_SIZE, BATCH_SIZE, RESIDUAL_SIZE * SWIGLUS * 2,
-                    &ONE,
+                    &alpha,
                     dSwigluSumWeights + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     // &ZERO,
