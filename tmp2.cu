@@ -2,7 +2,7 @@
 
 #define LOG_SKIPS (64 * 2)
 #define EPOCHS (1024 * 2)
-#define BATCH_ITERATIONS 2
+#define BATCH_ITERATIONS 1
 #define BATCH_SIZE (1024)
 
 #define INPUT_BITS 16
@@ -67,7 +67,6 @@ int main() {
                     hInput[offset + INPUT_BITS + bit] = (float)((b >> bit) & 1u);
                 }
                 unsigned int c = a + b;
-                // unsigned int c = b << INPUT_BITS | a;
                 for (int bit = 0; bit < INPUT_BITS * 2; bit++) {
                     hOutput[offset + bit] = (float)((c >> bit) & 1u);
                 }
@@ -141,14 +140,9 @@ int main() {
                     cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
                     dBackwardTop, 1, dBackwardTop, 1, &batchLoss
                 );
-                // cublasSasum(
-                //     cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
-                //     dBackwardTop, 1, &batchError
-                // );
-                cublasNrm2Ex(
+                cublasSasum(
                     cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
-                    dBackwardTop, CUDA_R_32F, 1,
-                    &batchError, CUDA_R_32F, CUDA_R_32F
+                    dBackwardTop, 1, &batchError
                 );
                 totalLoss += batchLoss;
                 totalError += batchError;
@@ -189,7 +183,7 @@ int main() {
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
                     RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE, BATCH_SIZE,
-                    &ONE,
+                    &LR_SCALE,
                     dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     dForward + forwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     &ONE,
@@ -206,8 +200,7 @@ int main() {
         
         // log loss
         if ((epoch + 1) % LOG_SKIPS == 0) {
-            // printf("Epoch %u: loss %.6f, error %.6f\n", epoch + 1, 0.5f * totalLoss * LR_SCALE, totalError * LR_SCALE);
-            printf("Epoch %u: loss %.6f, error %.6f\n", epoch + 1, 0.5f * totalLoss * LR_SCALE, totalError * rsqrtf(BATCH_SIZE * INPUT_BITS * 2 * BATCH_ITERATIONS));
+            printf("Epoch %u: loss %.6f, error %.6f\n", epoch + 1, 0.5f * totalLoss * LR_SCALE, totalError * LR_SCALE);
         }
         
         // apply gradients

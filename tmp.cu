@@ -320,11 +320,11 @@ void reluGradF32(uint32_t height, uint32_t width, float* dReluTensor, float* dTe
 #define HIDDENS (256)
 #define COMPRESS_DIM (256)
 #define OUTPUTS (32)
-#define LAYERS (32)
+#define LAYERS (32 * 4)
 #define BATCHES (1024)
 #define SEQUENCES (1)
 
-#define WEIGHT_LEARNING_RATE (0.1f * invSqrt(SEQUENCES * BATCHES * HIDDENS))
+#define WEIGHT_LEARNING_RATE (0.01f * invSqrt(SEQUENCES * BATCHES * HIDDENS))
 #define BIAS_LEARNING_RATE (WEIGHT_LEARNING_RATE)
 #define MEAN_BETA (0.9f)
 #define VAR_BETA (0.999f)
@@ -389,7 +389,8 @@ int main() {
     cudaMemset(dBiases, 0, SEQUENCES * HIDDENS * sizeof(float));
     cudaMemset(dBiasGradMeans, 0, SEQUENCES * HIDDENS * sizeof(float));
     cudaMemset(dBiasGradVars, 0, SEQUENCES * HIDDENS * sizeof(float));
-    randomizeDeviceTensorF32(LAYERS * HIDDENS, 2 * HIDDENS, dWeights, 2 * HIDDENS, &seed, -invSqrt(HIDDENS), invSqrt(HIDDENS));
+    // randomizeDeviceTensorF32(LAYERS * HIDDENS, 2 * HIDDENS, dWeights, 2 * HIDDENS, &seed, -invSqrt(HIDDENS), invSqrt(HIDDENS));
+    randomizeDeviceTensorF32(LAYERS * HIDDENS, 2 * HIDDENS, dWeights, 2 * HIDDENS, &seed, -0.02, 0.02);
     cudaMemset(dWeightGradMeans, 0, LAYERS * HIDDENS * (2 * HIDDENS) * sizeof(float));
     cudaMemset(dWeightGradVars, 0, LAYERS * HIDDENS * (2 * HIDDENS) * sizeof(float));
     // randomizeDeviceTensorF32(LAYERS * HIDDENS, COMPRESS_DIM, dWeight1s, COMPRESS_DIM, &seed, -invSqrt(COMPRESS_DIM), invSqrt(COMPRESS_DIM));
@@ -521,11 +522,15 @@ int main() {
         cudaMemset2D(dLogitGrads + LAYERS * SEQUENCES * BATCHES * (2 * HIDDENS) + OUTPUTS, 2 * HIDDENS * sizeof(float), 0, (2 * HIDDENS - OUTPUTS) * sizeof(float), SEQUENCES * BATCHES);
         if ((epoch + 1) % LOG_SKIPS == 0) {
             float err;
-            cublasNrm2Ex(
-                cublasHandle, SEQUENCES * BATCHES * (2 * HIDDENS),
-                dLogitGrads + LAYERS * SEQUENCES * BATCHES * (2 * HIDDENS), CUDA_R_32F, 1,
-                &err, CUDA_R_32F, CUDA_R_32F);
-            printf("Epoch %d: %f\n", epoch + 1, err * invSqrt(SEQUENCES * BATCHES * OUTPUTS));
+            // cublasNrm2Ex(
+            //     cublasHandle, SEQUENCES * BATCHES * (2 * HIDDENS),
+            //     dLogitGrads + LAYERS * SEQUENCES * BATCHES * (2 * HIDDENS), CUDA_R_32F, 1,
+            //     &err, CUDA_R_32F, CUDA_R_32F);
+              cublasSasum(
+                  cublasHandle, SEQUENCES * BATCHES * (2 * HIDDENS),
+                  dLogitGrads + LAYERS * SEQUENCES * BATCHES * (2 * HIDDENS), 1, &err
+              );
+            printf("Epoch %d: %f\n", epoch + 1, err / ((float)SEQUENCES * BATCHES * OUTPUTS));
         }
         
         // cudaMemcpy2D(
@@ -660,7 +665,7 @@ int main() {
         }
         meanCor *= MEAN_BETA;
         varCor *= VAR_BETA;
-        adamUpdateF32(LAYERS * HIDDENS * (2 * HIDDENS), WEIGHT_LEARNING_RATE, dWeightGrads, dWeightGradMeans, dWeightGradVars, dWeights, 1.0f / (1.0f - meanCor), 1.0f / (1.0f - varCor), EPSILON);
+        adamUpdateF32(LAYERS * HIDDENS * (2 * HIDDENS), WEIGHT_LEARNING_RATE, dWeightGrads, dWeightGradMeans, dWeightGradVars, dWeights, 1, 1, EPSILON);
         // adamUpdateF32(SEQUENCES * HIDDENS, BIAS_LEARNING_RATE, dBiasGrads, dBiasGradMeans, dBiasGradVars, dBiases, 1.0f / (1.0f - meanCor), 1.0f / (1.0f - varCor), EPSILON);
         
         // adamUpdateF32(LAYERS * HIDDENS * COMPRESS_DIM, WEIGHT_LEARNING_RATE, 

@@ -1,17 +1,16 @@
 ﻿#include "header.cuh"
 
-#define LOG_SKIPS (64 * 1)
-#define EPOCHS (1024 * 1)
+#define LOG_SKIPS (64 * 2)
+#define EPOCHS (1024 * 2)
 #define BATCH_ITERATIONS (1)
 #define BATCH_SIZE (1024)
 
 #define INPUT_BITS (16)
 #define RESIDUAL_SIZE (256)
 #define SWIGLUS (1)
-#define LAYERS (32 * 16)
+#define LAYERS (32 * 4)
 
-#define K 0.0001f
-#define LR 0.001f
+#define LR 0.0002f
 #define MEAN_BETA 0.9f
 #define VAR_BETA 0.999f
 #define EPSILON 1e-8f
@@ -44,8 +43,7 @@ int main() {
     normalRandFill(
         RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE * LAYERS,
         dSwigluSumWeights, RESIDUAL_SIZE * SWIGLUS * 2,
-        // seed, 0.0f, 0.02f
-        seed, 0.0f, rsqrtf(RESIDUAL_SIZE)
+        seed, 0.0f, 0.02f
     );
     
     time_t start_time, end_time;
@@ -68,7 +66,6 @@ int main() {
                     hInput[offset + INPUT_BITS + bit] = (float)((b >> bit) & 1u);
                 }
                 unsigned int c = a + b;
-                // unsigned int c = b << INPUT_BITS | a;
                 for (int bit = 0; bit < INPUT_BITS * 2; bit++) {
                     hOutput[offset + bit] = (float)((c >> bit) & 1u);
                 }
@@ -106,14 +103,26 @@ int main() {
                 int nextForwardLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE + forwardLayerOffset;
                 int swigluSumWeightLayerOffset = RESIDUAL_SIZE * SWIGLUS * 2 * RESIDUAL_SIZE * layer;
                 
+                // batchnorm
+                batchNorm(
+                    RESIDUAL_SIZE, BATCH_SIZE,
+                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dNorm, RESIDUAL_SIZE, 0,
+                    1
+                );
+                // printDeviceTensor(
+                //     "norm %d",
+                //     RESIDUAL_SIZE, BATCH_SIZE,
+                //     dNorm, RESIDUAL_SIZE, layer
+                // );
+                
                 // swiglus gemm
-                float alpha = 1 - (1 - rsqrtf(layer + 1)) * expf(-K * epoch);
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
                     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE, RESIDUAL_SIZE,
-                    &alpha,
+                    &ONE,
                     dSwigluSumWeights + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    dForward + forwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
+                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
                     &ZERO,
                     dForward + nextForwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
@@ -167,14 +176,9 @@ int main() {
                     cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
                     dBackwardTop, 1, dBackwardTop, 1, &batchLoss
                 );
-                // cublasSasum(
-                //     cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
-                //     dBackwardTop, 1, &batchError
-                // );
-                cublasNrm2Ex(
+                cublasSasum(
                     cublasHandle, RESIDUAL_SIZE * SWIGLUS * 2 * BATCH_SIZE,
-                    dBackwardTop, CUDA_R_32F, 1,
-                    &batchError, CUDA_R_32F, CUDA_R_32F
+                    dBackwardTop, 1, &batchError
                 );
                 totalLoss += batchLoss;
                 totalError += batchError;
@@ -204,15 +208,14 @@ int main() {
                 // );
                 
                 // swiglu gemm grad
-                float alpha = 1 - (1 - rsqrtf(layer + 1)) * expf(-K * epoch);
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
                     RESIDUAL_SIZE, BATCH_SIZE, RESIDUAL_SIZE * SWIGLUS * 2,
-                    &alpha,
+                    &ONE,
                     dSwigluSumWeights + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    &ONE,
-                    dBackwardBottom, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
+                    &ZERO,
+                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
                     CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
                 );
                 // printDeviceTensor(
@@ -221,13 +224,27 @@ int main() {
                 //     dNorm, RESIDUAL_SIZE, layer
                 // );
                 
+                // batchnorm grad
+                batchNormGrad(
+                    RESIDUAL_SIZE, BATCH_SIZE,
+                    dNorm, RESIDUAL_SIZE, 0,
+                    dForward + forwardLayerOffset, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, 0,
+                    1
+                );
+                // printDeviceTensor(
+                //     "residual batchnorm grad %d",
+                //     RESIDUAL_SIZE * SWIGLUS * 2, BATCH_SIZE,
+                //     dBackwardBottom, RESIDUAL_SIZE * SWIGLUS * 2, layer
+                // );
+                
                 // swiglu gemm weight grad
                 cublasGemmEx(
                     cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
                     RESIDUAL_SIZE * SWIGLUS * 2, RESIDUAL_SIZE, BATCH_SIZE,
                     &LR_SCALE,
                     dBackwardTop, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
-                    dForward + forwardLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
+                    dNorm, CUDA_R_32F, RESIDUAL_SIZE,
                     &ONE,
                     dSwigluSumWeightGrads + swigluSumWeightLayerOffset, CUDA_R_32F, RESIDUAL_SIZE * SWIGLUS * 2,
                     CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT
@@ -247,8 +264,7 @@ int main() {
         
         // log loss
         if ((epoch + 1) % LOG_SKIPS == 0) {
-            // printf("Epoch %u: loss %.6f, error %.6f\n", epoch + 1, 0.5f * totalLoss * LR_SCALE, totalError * LR_SCALE);
-            printf("Epoch %u: loss %.6f, error %.6f\n", epoch + 1, 0.5f * totalLoss * LR_SCALE, totalError * rsqrtf(BATCH_SIZE * INPUT_BITS * 2));
+            printf("Epoch %u: loss %.6f, error %.6f\n", epoch + 1, 0.5f * totalLoss * LR_SCALE, totalError * LR_SCALE);
         }
         
         // apply gradients
